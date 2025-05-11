@@ -16,10 +16,27 @@
 (define-constant ERR-RATING-OUT-OF-RANGE u111)
 (define-constant ERR-ALREADY-RATED u112)
 (define-constant ERR-INVALID-FEE u113)
+(define-constant ERR-INVALID-PARAMS u114)
+(define-constant ERR-INVALID-TIME u115)
+(define-constant ERR-INVALID-ENERGY u116)
+(define-constant ERR-INVALID-LOCATION u117)
+(define-constant ERR-INVALID-POWER u118)
+(define-constant ERR-INVALID-CONNECTOR u119)
 
 ;; Principal Variables
 (define-data-var contract-admin principal tx-sender)
 (define-data-var platform-fee-percentage uint u5) ;; Default 5%
+
+;; Time counter (for simulating timestamps since block-height is unavailable)
+(define-data-var time-counter uint u1)
+
+;; Maximum values for validation
+(define-constant MAX-POWER-OUTPUT u1000) ;; 1000 kW max
+(define-constant MAX-PRICE-PER-KWH u10000) ;; 100.00 STX per kWh max
+(define-constant MAX-LOCATION-VALUE 90000000) ;; Roughly +/-90 degrees * 1,000,000 for precision
+(define-constant MAX-DURATION u10080) ;; 1 week in minutes
+(define-constant MAX-TIME-INCREMENT u525600) ;; 1 year in minutes
+(define-constant MAX-ENERGY-USED u1000000) ;; 10,000 kWh * 100 for precision
 
 ;; Data Maps
 
@@ -77,12 +94,32 @@
 (define-data-var next-reservation-id uint u1)
 (define-data-var next-session-id uint u1)
 
+;; Time handling functions
+(define-read-only (get-current-time)
+  (var-get time-counter)
+)
+
+(define-public (advance-time (amount uint))
+  (begin
+    ;; Check authorization
+    (asserts! (is-eq tx-sender (var-get contract-admin)) (err ERR-NOT-AUTHORIZED))
+    ;; Validate amount
+    (asserts! (and (> amount u0) (<= amount MAX-TIME-INCREMENT)) (err ERR-INVALID-TIME))
+    ;; Advance time counter
+    (ok (var-set time-counter (+ (var-get time-counter) amount)))
+  )
+)
+
 ;; Admin Functions
 
 ;; Set contract administrator
 (define-public (set-admin (new-admin principal))
   (begin
+    ;; Check authorization
     (asserts! (is-eq tx-sender (var-get contract-admin)) (err ERR-NOT-AUTHORIZED))
+    ;; Validate new admin is not null principal
+    (asserts! (not (is-eq new-admin 'SP000000000000000000002Q6VF78)) (err ERR-INVALID-PARAMS))
+    ;; Update contract admin
     (ok (var-set contract-admin new-admin))
   )
 )
@@ -90,8 +127,11 @@
 ;; Set platform fee percentage
 (define-public (set-platform-fee (fee-percentage uint))
   (begin
+    ;; Check authorization
     (asserts! (is-eq tx-sender (var-get contract-admin)) (err ERR-NOT-AUTHORIZED))
+    ;; Validate fee is within range
     (asserts! (< fee-percentage u100) (err ERR-INVALID-FEE))
+    ;; Update platform fee
     (ok (var-set platform-fee-percentage fee-percentage))
   )
 )
@@ -105,8 +145,16 @@
                 (price-per-kwh uint)
                 (connector-type (string-ascii 20))
                 (power-output uint))
-  (let ((station-id (var-get next-station-id)))
-    (asserts! (> price-per-kwh u0) (err ERR-INVALID-PRICING))
+  (let ((station-id (var-get next-station-id))
+        (connector-length (len connector-type)))
+    ;; Validate parameters
+    (asserts! (and (>= location-lat (* -1 MAX-LOCATION-VALUE)) (<= location-lat MAX-LOCATION-VALUE)) (err ERR-INVALID-LOCATION))
+    (asserts! (and (>= location-lng (* -1 MAX-LOCATION-VALUE)) (<= location-lng MAX-LOCATION-VALUE)) (err ERR-INVALID-LOCATION))
+    (asserts! (and (> price-per-kwh u0) (<= price-per-kwh MAX-PRICE-PER-KWH)) (err ERR-INVALID-PRICING))
+    (asserts! (and (> connector-length u0) (<= connector-length u20)) (err ERR-INVALID-CONNECTOR))
+    (asserts! (and (> power-output u0) (<= power-output MAX-POWER-OUTPUT)) (err ERR-INVALID-POWER))
+    
+    ;; Create station record
     (map-insert charging-stations station-id
       {
         owner: tx-sender,
@@ -120,6 +168,7 @@
         sum-ratings: u0
       }
     )
+    ;; Increment station ID counter
     (var-set next-station-id (+ station-id u1))
     (ok station-id)
   )
@@ -128,7 +177,9 @@
 ;; Update station availability
 (define-public (update-station-availability (station-id uint) (available bool))
   (let ((station (unwrap! (map-get? charging-stations station-id) (err ERR-STATION-NOT-FOUND))))
+    ;; Check authorization
     (asserts! (is-eq tx-sender (get owner station)) (err ERR-NOT-STATION-OWNER))
+    ;; Update station availability
     (map-set charging-stations station-id
       (merge station {available: available})
     )
@@ -139,8 +190,11 @@
 ;; Update station pricing
 (define-public (update-station-pricing (station-id uint) (price-per-kwh uint))
   (let ((station (unwrap! (map-get? charging-stations station-id) (err ERR-STATION-NOT-FOUND))))
+    ;; Check authorization
     (asserts! (is-eq tx-sender (get owner station)) (err ERR-NOT-STATION-OWNER))
-    (asserts! (> price-per-kwh u0) (err ERR-INVALID-PRICING))
+    ;; Validate price
+    (asserts! (and (> price-per-kwh u0) (<= price-per-kwh MAX-PRICE-PER-KWH)) (err ERR-INVALID-PRICING))
+    ;; Update station pricing
     (map-set charging-stations station-id
       (merge station {price-per-kwh: price-per-kwh})
     )
@@ -155,9 +209,12 @@
   (let (
     (station (unwrap! (map-get? charging-stations station-id) (err ERR-STATION-NOT-FOUND)))
     (reservation-id (var-get next-reservation-id))
+    (current-time (get-current-time))
   )
+    ;; Validate parameters
     (asserts! (get available station) (err ERR-STATION-NOT-AVAILABLE))
-    (asserts! (> duration u0) (err ERR-INVALID-RESERVATION))
+    (asserts! (>= start-time current-time) (err ERR-INVALID-TIME))
+    (asserts! (and (> duration u0) (<= duration MAX-DURATION)) (err ERR-INVALID-RESERVATION))
     
     ;; Create reservation
     (map-insert reservations reservation-id
@@ -184,6 +241,7 @@
     (session-id (var-get next-session-id))
     (current-time (get-current-time))
   )
+    ;; Check authorization
     (asserts! (is-eq tx-sender (get user reservation)) (err ERR-NOT-AUTHORIZED))
     (asserts! (is-eq (get status reservation) "pending") (err ERR-INVALID-RESERVATION))
     (asserts! (get available station) (err ERR-STATION-NOT-AVAILABLE))
@@ -229,39 +287,46 @@
     (price-per-kwh (get price-per-kwh station))
     (platform-fee (var-get platform-fee-percentage))
     (station-owner (get owner station))
-    (raw-cost (* energy-used price-per-kwh))
-    (platform-fee-amount (/ (* raw-cost platform-fee) u100))
-    (station-owner-amount (- raw-cost platform-fee-amount))
   )
     ;; Check authorization - either station owner or user can complete
     (asserts! (or (is-eq tx-sender (get user session)) (is-eq tx-sender station-owner)) (err ERR-NOT-AUTHORIZED))
     (asserts! (not (get completed session)) (err ERR-INVALID-RESERVATION))
     
-    ;; Calculate payment
-    (unwrap! (stx-transfer? raw-cost tx-sender (var-get contract-admin)) (err ERR-INSUFFICIENT-FUNDS))
-    (unwrap! (stx-transfer? station-owner-amount (var-get contract-admin) station-owner) (err u0))
+    ;; Validate energy used
+    (asserts! (and (> energy-used u0) (<= energy-used MAX-ENERGY-USED)) (err ERR-INVALID-ENERGY))
     
-    ;; Update session data
-    (map-set charging-sessions session-id
-      (merge session {
-        end-time: current-time,
-        energy-used: energy-used,
-        total-cost: raw-cost,
-        completed: true
-      })
+    ;; Calculate cost and fees
+    (let (
+      (raw-cost (* energy-used price-per-kwh))
+      (platform-fee-amount (/ (* raw-cost platform-fee) u100))
+      (station-owner-amount (- raw-cost platform-fee-amount))
     )
-    
-    ;; Update reservation status
-    (map-set reservations reservation-id
-      (merge reservation {status: "completed"})
+      ;; Process payment
+      (unwrap! (stx-transfer? raw-cost tx-sender (var-get contract-admin)) (err ERR-INSUFFICIENT-FUNDS))
+      (unwrap! (stx-transfer? station-owner-amount (var-get contract-admin) station-owner) (err u0))
+      
+      ;; Update session data
+      (map-set charging-sessions session-id
+        (merge session {
+          end-time: current-time,
+          energy-used: energy-used,
+          total-cost: raw-cost,
+          completed: true
+        })
+      )
+      
+      ;; Update reservation status
+      (map-set reservations reservation-id
+        (merge reservation {status: "completed"})
+      )
+      
+      ;; Mark station as available again
+      (map-set charging-stations station-id
+        (merge station {available: true})
+      )
+      
+      (ok true)
     )
-    
-    ;; Mark station as available again
-    (map-set charging-stations station-id
-      (merge station {available: true})
-    )
-    
-    (ok true)
   )
 )
 
@@ -271,8 +336,6 @@
     (station (unwrap! (map-get? charging-stations station-id) (err ERR-STATION-NOT-FOUND)))
     (rating-key {station-id: station-id, user: tx-sender})
     (current-rating (map-get? user-ratings rating-key))
-    (total-ratings (get total-ratings station))
-    (sum-ratings (get sum-ratings station))
   )
     ;; Check rating is between 1-5
     (asserts! (and (>= rating u1) (<= rating u5)) (err ERR-RATING-OUT-OF-RANGE))
@@ -281,15 +344,20 @@
     ;; Add the new rating
     (map-set user-ratings rating-key rating)
     
-    ;; Update station rating data
-    (map-set charging-stations station-id
-      (merge station {
-        total-ratings: (+ total-ratings u1),
-        sum-ratings: (+ sum-ratings rating)
-      })
+    ;; Update station rating data safely
+    (let (
+      (total-ratings (get total-ratings station))
+      (sum-ratings (get sum-ratings station))
     )
-    
-    (ok true)
+      (map-set charging-stations station-id
+        (merge station {
+          total-ratings: (+ total-ratings u1),
+          sum-ratings: (+ sum-ratings rating)
+        })
+      )
+      
+      (ok true)
+    )
   )
 )
 
@@ -312,27 +380,21 @@
 
 ;; Get the average rating for a station
 (define-read-only (get-station-average-rating (station-id uint))
-  (let (
-    (station (unwrap! (map-get? charging-stations station-id) (none)))
-    (total-ratings (get total-ratings station))
-    (sum-ratings (get sum-ratings station))
-  )
-    (if (is-eq total-ratings u0)
-      none
-      (some (/ sum-ratings total-ratings))
+  (match (map-get? charging-stations station-id)
+    station (let (
+      (total-ratings (get total-ratings station))
+      (sum-ratings (get sum-ratings station))
     )
+      (if (is-eq total-ratings u0)
+        (ok u0)  ;; Return 0 if no ratings
+        (ok (/ sum-ratings total-ratings))
+      )
+    )
+    (err ERR-STATION-NOT-FOUND)
   )
 )
 
 ;; Get the current platform fee percentage
 (define-read-only (get-platform-fee)
   (var-get platform-fee-percentage)
-)
-
-;; Helper function to get current time (using a workaround since block-height is not available)
-(define-read-only (get-current-time)
-  ;; In a production contract, you would need a mechanism to get the current time
-  ;; For now we'll use tx-sender as a source of entropy to simulate time
-  ;; In real implementation, consider using oracles or other timestamp sources
-  (len (unwrap-panic (as-max-len? (principal->string tx-sender) u100)))
 )
